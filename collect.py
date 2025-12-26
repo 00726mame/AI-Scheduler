@@ -12,16 +12,16 @@ from tqdm import tqdm
 
 # Configuration
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPISODES = 50
-STEPS_PER_EPISODE = 50
+EPISODES = 200
+STEPS_PER_EPISODE = 60
 CONTEXT_LENGTH = 128
 SAVE_PATH = "trajectories.pkl"
 
-class TinyStoriesDataset(IterableDataset):
+class WikipediaDataset(IterableDataset):
     def __init__(self, tokenizer, max_length=128):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        self.dataset = load_dataset("wikimedia/wikipedia", "20231101.ja", split="train", streaming=True)
         
     def __iter__(self):
         iterator = iter(self.dataset)
@@ -29,7 +29,7 @@ class TinyStoriesDataset(IterableDataset):
         while True:
             try:
                 item = next(iterator)
-                text = item['text']
+                text = "タイトル:\n" + item["title"] + "\n\n本文:\n" + item["text"]
                 tokenized = self.tokenizer(text, add_special_tokens=True)['input_ids']
                 buffer.extend(tokenized)
                 
@@ -85,6 +85,41 @@ class TrainingEnv:
         
         return loss.item(), total_norm.item(), weight_norm
 
+# Utils for State Management
+def recursive_clone(obj):
+    if isinstance(obj, torch.Tensor): 
+        return obj.clone()
+    elif isinstance(obj, dict): 
+        return {k: recursive_clone(v) for k, v in obj.items()}
+    elif isinstance(obj, list): 
+        return [recursive_clone(v) for v in obj]
+    else: 
+        return obj
+
+def recursive_update(src, dst):
+    if isinstance(src, dict) and isinstance(dst, dict):
+        for k, v in src.items():
+            if k in dst:
+                if isinstance(v, torch.Tensor) and isinstance(dst[k], torch.Tensor):
+                    dst[k].copy_(v)
+                elif isinstance(v, (dict, list)):
+                    recursive_update(v, dst[k])
+                else:
+                    dst[k] = v
+            else:
+                dst[k] = recursive_clone(v)
+    elif isinstance(src, list) and isinstance(dst, list):
+        for i, v in enumerate(src):
+            if i < len(dst):
+                if isinstance(v, torch.Tensor) and isinstance(dst[i], torch.Tensor):
+                    dst[i].copy_(v)
+                elif isinstance(v, (dict, list)):
+                    recursive_update(v, dst[i])
+                else:
+                    dst[i] = v
+            else:
+                dst.append(recursive_clone(v))
+
 def get_action_values(action):
     """Map normalized action to hyperparameters."""
     action = np.clip(action, -1.0, 1.0)
@@ -111,8 +146,10 @@ def collect_data(episodes=EPISODES, save_path=SAVE_PATH):
     # Use standard tokenizer (requires internet to download vocab)
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+    # Suppress warning about token length (we chunk manually)
+    tokenizer.model_max_length = 100000
     
-    dataset = TinyStoriesDataset(tokenizer, max_length=CONTEXT_LENGTH)
+    dataset = WikipediaDataset(tokenizer, max_length=CONTEXT_LENGTH)
     dataloader = DataLoader(dataset, batch_size=8)
     data_iterator = iter(dataloader)
     
@@ -124,6 +161,10 @@ def collect_data(episodes=EPISODES, save_path=SAVE_PATH):
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4) # Initial dummy
         env = TrainingEnv(model, optimizer, DEVICE)
         
+        # Buffer for state snapshot
+        buffer_model_state = recursive_clone(model.state_dict())
+        buffer_opt_state = recursive_clone(optimizer.state_dict())
+
         # Get initial batch
         try:
             batch = next(data_iterator)
@@ -145,76 +186,149 @@ def collect_data(episodes=EPISODES, save_path=SAVE_PATH):
         # Initial Action (Neutral)
         current_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         
+        # variables to track for state
+        grad_norm = 0.0
+        weight_norm = 0.0
+        
         for step in range(STEPS_PER_EPISODE):
-            # State: [loss, ema_loss, 0, 0, progress]
-            state = np.array([current_loss, ema_loss, 0.0, 0.0, step/STEPS_PER_EPISODE], dtype=np.float32)
+            # Calculate derived features
+            delta_loss = current_loss - prev_loss
             
-            # Greedy / Exploration Logic
-            best_action = current_action
+            # Re-calculate params to get LR
+            current_params_state = get_action_values(current_action)
+            current_log_lr = np.log10(current_params_state["lr"] + 1e-9)
+
+            # State: [loss, ema_loss, grad_norm, weight_norm, progress, log_lr, delta_loss]
+            progress = step / STEPS_PER_EPISODE
+            state = np.array([
+                current_loss, 
+                ema_loss, 
+                grad_norm, 
+                weight_norm, 
+                progress,
+                current_log_lr,
+                delta_loss
+            ], dtype=np.float32)
             
+            # --- Best-of-N Candidate Selection ---
+            
+            # Snapshot current state
+            recursive_update(model.state_dict(), buffer_model_state)
+            recursive_update(optimizer.state_dict(), buffer_opt_state)
+
             # Candidates: [Increase LR, Keep, Decrease LR]
-            candidates = [
-                np.clip(current_action + np.array([0.6, 0.0, 0.0]), -1.0, 1.0).astype(np.float32),
+            candidates_cfg = [
+                np.clip(current_action + np.array([0.5, 0.0, 0.0]), -1.0, 1.0).astype(np.float32),
+                np.clip(current_action + np.array([0.1, 0.0, 0.0]), -1.0, 1.0).astype(np.float32),
                 current_action,
-                np.clip(current_action - np.array([0.6, 0.0, 0.0]), -1.0, 1.0).astype(np.float32)
+                np.clip(current_action - np.array([0.5, 0.0, 0.0]), -1.0, 1.0).astype(np.float32),
+                np.clip(current_action - np.array([0.1, 0.0, 0.0]), -1.0, 1.0).astype(np.float32)
             ]
             
-            # Epsilon-Greedy
-            if random.random() < 0.2:
-                action = random.choice(candidates)
-                # Small random noise
-                noise = np.random.normal(0, 0.1, size=3).astype(np.float32)
-                action = np.clip(action + noise, -1.0, 1.0)
-            else:
-                # Normally we would simulate to find best, but here we simplify
-                # For true greedy we need to look ahead (evaluate loss for each candidate).
-                # But to keep it lightweight (avoiding 3x forward passes per step), 
-                # we will just pick a candidate randomly weighted or stick to current?
-                # Wait, the user ASKED for Greedy Search.
-                # In 1_collect_data.py, it says "Simulation omitted (simplified)". 
-                # So it was basically random choice there too!
-                # I will replicate the "Random Choice from Candidates" logic exactly as requested.
-                action = random.choice(candidates)
-
-            current_action = action
-            params = get_action_values(action)
-            
-            # Get next batch
+            # Get next batch for evaluation
             try:
                 batch = next(data_iterator)
             except StopIteration:
                 data_iterator = iter(dataloader)
                 batch = next(data_iterator)
+
+            best_result = None
+            best_reward = -float('inf')
+
+            # Epsilon-Greedy Exploration
+            # If random < 0.2, just pick one randomly without simulation? 
+            # OR simulate all but pick random? 
+            # User wants "Select Best", so we should Simulate All.
+            # But maybe add noise to candidates?
+            
+            # Let's clean candidates: Add noise?
+            # 1_collect_data does: momentum, local(+noise), global.
+            # Here we keep simple set.
+            
+            evaluated_candidates = []
+
+            for cand_action in candidates_cfg:
+                # Add small noise for diversity
+                cand_action = np.clip(cand_action + np.random.normal(0, 0.05, size=3), -1.0, 1.0).astype(np.float32)
                 
-            # Step
-            try:
-                loss, grad_norm, weight_norm = env.step(params, batch)
+                # Restore state
+                model.load_state_dict(buffer_model_state)
+                optimizer.load_state_dict(buffer_opt_state)
                 
-                # Reward Calculation
-                # Improvement Reward
-                reward = (prev_loss - loss) * 10.0
+                params = get_action_values(cand_action)
                 
-                # Stability Penalty
-                if math.isnan(loss) or loss > 20.0:
-                    reward = -10.0
-                    loss = 20.0 # Cap
+                try:
+                    c_loss, c_grad_norm, c_weight_norm = env.step(params, batch)
+                    
+                    if math.isnan(c_loss) or math.isinf(c_loss):
+                        c_loss = 20.0
+                        
+                    # Calculate Reward
+                    # 1. Improvement
+                    rel_improvement = (prev_loss - c_loss) / (prev_loss + 1e-6)
+                    r_im = rel_improvement * 10.0 # Scale
+                    
+                    # 2. Stability (Grad Norm)
+                    if math.isnan(c_grad_norm): c_grad_norm = 100.0
+                    r_st = 0.5 if c_grad_norm < 2.0 else -0.5 # Simple threshold reward
+                    # User asked to consider grad_norm
+                    
+                    # 3. Absolute Loss
+                    r_abs = max(0, 2.0 - c_loss) * 0.5
+                    
+                    total_reward = r_im + r_st + r_abs
+                    
+                    # Store
+                    res = {
+                        "action": cand_action,
+                        "loss": c_loss,
+                        "grad_norm": c_grad_norm,
+                        "weight_norm": c_weight_norm,
+                        "reward": total_reward,
+                        "model_state": recursive_clone(model.state_dict()),
+                        "opt_state": recursive_clone(optimizer.state_dict())
+                    }
+                    evaluated_candidates.append(res)
+                    
+                except Exception as e:
+                    pass
+
+            # Selection
+            if len(evaluated_candidates) > 0:
+                # Epsilon-Greedy on SELECTION
+                if random.random() < 0.1:
+                    # Random selection from evaluated to enable exploration
+                    selected = random.choice(evaluated_candidates)
+                else:
+                    # Greedy selection
+                    evaluated_candidates.sort(key=lambda x: x["reward"], reverse=True)
+                    selected = evaluated_candidates[0]
                 
-                # Small penalty for extreme actions?
+                # Apply selected state
+                current_action = selected["action"]
+                loss = selected["loss"]
+                grad_norm = selected["grad_norm"]
+                weight_norm = selected["weight_norm"]
+                reward = selected["reward"]
                 
-                reward = np.clip(reward, -5.0, 5.0)
+                # Restore the selected state to be the current state
+                model.load_state_dict(selected["model_state"])
+                optimizer.load_state_dict(selected["opt_state"])
                 
-                # Update State
-                ema_loss = 0.9 * ema_loss + 0.1 * loss
-                prev_loss = loss
-                current_loss = loss
-                
-            except Exception as e:
-                print(f"Step Error: {e}")
-                reward = -10.0
-                loss = 20.0
+            else:
+                # Fallback if all failed
+                loss = prev_loss
+                reward = -2.0
+                model.load_state_dict(buffer_model_state)
+                optimizer.load_state_dict(buffer_opt_state)
+
+            # Update State Trackers
+            ema_loss = 0.9 * ema_loss + 0.1 * loss
+            prev_loss = current_loss 
+            current_loss = loss
             
             obs_buf.append(state)
-            act_buf.append(action)
+            act_buf.append(current_action)
             rew_buf.append(reward)
             
         all_trajectories.append({
@@ -231,9 +345,12 @@ def collect_data(episodes=EPISODES, save_path=SAVE_PATH):
 
 if __name__ == "__main__":
     import argparse
+    import sys
     parser = argparse.ArgumentParser()
-    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--save_path", type=str, default="trajectories.pkl")
     args = parser.parse_args()
     
     collect_data(episodes=args.episodes, save_path=args.save_path)
+    # Force exit to avoid PyGILState_Release fatal errors due to threads
+    sys.exit(0)

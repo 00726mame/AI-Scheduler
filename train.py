@@ -1,4 +1,3 @@
-
 import os
 import pickle
 import numpy as np
@@ -6,8 +5,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import DecisionTransformerConfig, DecisionTransformerModel, get_linear_schedule_with_warmup
-from galore_torch import GaLoreAdamW8bit
-from .utils import get_statistics, normalize_trajectories
+
+try:
+    from .utils import get_statistics, normalize_trajectories
+except ImportError:
+    from utils import get_statistics, normalize_trajectories
 
 class TrajectoryDataset(Dataset):
     def __init__(self, trajectories, context_length=20):
@@ -55,8 +57,8 @@ class TrajectoryDataset(Dataset):
 def train_scheduler(
     trajectory_path="trajectories.pkl",
     save_path="./ai_scheduler_model",
-    context_length=20,
-    epochs=50,
+    context_length=50,
+    epochs=10,
     lr=3e-4,
     batch_size=64,
     rtg_scale=1000.0
@@ -78,7 +80,7 @@ def train_scheduler(
 
     trajectories = [t for t in trajectories if len(t['observations']) > 5]
     trajectories.sort(key=lambda x: sum(x['rewards']), reverse=True)
-    trajectories = trajectories[:int(len(trajectories)*0.4)] # Top 40%
+    trajectories = trajectories[:int(len(trajectories)*0.3)] # Top 40%
 
     stats = get_statistics(trajectories)
     stats['rtg_scale'] = rtg_scale
@@ -94,19 +96,19 @@ def train_scheduler(
     
     # Config (Standard DT for HPO)
     config = DecisionTransformerConfig(
-        state_dim=5, # loss, ema, 0, 0, progress
-        act_dim=3,   # lr_action, wd_action, grad_norm_action
+        state_dim=7,
+        act_dim=3,
         max_ep_len=1000,
-        hidden_size=256,
-        n_layer=4,
-        n_head=4
+        hidden_size=256,  # 768 -> 256 に下げる
+        n_layer=4,        # 12 -> 4 に浅くする
+        n_head=4          # 12 -> 4 (Head Dimは64を維持！)
     )
     
     model = DecisionTransformerModel(config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     
-    optimizer = GaLoreAdamW8bit(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(len(dataloader)*epochs*0.1), num_training_steps=len(dataloader)*epochs)
     
